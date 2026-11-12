@@ -17,12 +17,14 @@ from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
+from django.core.files.base import ContentFile
 from django.core.validators import validate_email
 from django.core.validators import URLValidator
 from django.db import transaction
 from django.db import IntegrityError
 from django.db.models import F, Q, Sum
 from django.http import HttpResponse, JsonResponse
+from django.http.multipartparser import MultiPartParser
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
 from django.utils import timezone
@@ -30,6 +32,7 @@ from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.views.decorators.csrf import csrf_exempt, csrf_protect
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
+from PIL import Image, ImageOps, UnidentifiedImageError
 import qrcode
 
 from .models import Category, DailyOrderSequence, Food, Order, OrderItem, PricingSettings, Restaurant
@@ -2288,14 +2291,17 @@ def restaurant_reports(request):
     })
 
 
-def _product_payload(food):
+def _product_payload(food, request=None):
+    image_url = food.image_file.url if food.image_file else food.image
+    if food.image_file and request is not None:
+        image_url = request.build_absolute_uri(image_url)
     return {
         "id": food.id,
         "name": food.name,
         "category": food.category.name if food.category else "",
         "categoryId": food.category_id,
         "description": food.description,
-        "image": food.image,
+        "image": image_url,
         "price": float(food.price),
         "available": food.available,
         "stockQuantity": food.stock_quantity,
@@ -2347,6 +2353,45 @@ def _parse_menu_options(value, label, allow_empty=True):
     return result
 
 
+def _product_image_upload_error(uploaded):
+    if uploaded.size <= 0 or uploaded.size > 3 * 1024 * 1024:
+        return "Product image must be smaller than 3 MB."
+    extension = uploaded.name.rsplit(".", 1)[-1].lower() if "." in uploaded.name else ""
+    signature = uploaded.read(12)
+    uploaded.seek(0)
+    signatures = {
+        "png": signature.startswith(b"\x89PNG\r\n\x1a\n"),
+        "jpg": signature.startswith(b"\xff\xd8\xff"),
+        "jpeg": signature.startswith(b"\xff\xd8\xff"),
+        "gif": signature[:6] in {b"GIF87a", b"GIF89a"},
+        "webp": signature.startswith(b"RIFF") and signature[8:12] == b"WEBP",
+    }
+    if not signatures.get(extension, False):
+        return "Product image must be a valid PNG, JPEG, GIF, or WebP image."
+    return None
+
+
+def _normalize_product_image(uploaded):
+    try:
+        uploaded.seek(0)
+        with Image.open(uploaded) as source:
+            image = ImageOps.exif_transpose(source)
+            image.thumbnail((1000, 1000), Image.Resampling.LANCZOS)
+            if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
+                rgba = image.convert("RGBA")
+                background = Image.new("RGB", rgba.size, "white")
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                image = background
+            else:
+                image = image.convert("RGB")
+            output = BytesIO()
+            image.save(output, format="JPEG", quality=80, optimize=True)
+        output.seek(0)
+        return ContentFile(output.getvalue())
+    except (UnidentifiedImageError, OSError, ValueError):
+        return None
+
+
 @csrf_protect
 @require_http_methods(["GET", "POST"])
 def restaurant_products(request):
@@ -2355,7 +2400,7 @@ def restaurant_products(request):
         return error
     if request.method == "GET":
         products = restaurant.foods.select_related("category").order_by("name")
-        return JsonResponse([_product_payload(food) for food in products], safe=False)
+        return JsonResponse([_product_payload(food, request) for food in products], safe=False)
     try:
         data = _json_body(request) if request.content_type == "application/json" else request.POST
     except ValueError as error:
@@ -2365,6 +2410,15 @@ def restaurant_products(request):
     quantity_unit = data.get("quantityUnit", "").strip()
     description = data.get("productDescription", "").strip()
     image = data.get("productImage", "").strip()
+    uploaded_image = request.FILES.get("productImageFile")
+    if uploaded_image:
+        upload_error = _product_image_upload_error(uploaded_image)
+        if upload_error:
+            return _error(upload_error)
+        normalized_image = _normalize_product_image(uploaded_image)
+        if normalized_image is None:
+            return _error("Product image could not be processed.")
+        uploaded_image = normalized_image
     raw_stock = data.get("stockQuantity", "").strip()
     try:
         stock_quantity = Decimal(raw_stock) if raw_stock else None
@@ -2387,7 +2441,7 @@ def restaurant_products(request):
         return _error("Choose kg or piece as the quantity unit.")
     if not price.is_finite() or price <= 0:
         return _error("Product price must be greater than zero.")
-    if image:
+    if image and not uploaded_image:
         try:
             URLValidator(schemes=["http", "https"])(image)
         except ValidationError:
@@ -2409,12 +2463,14 @@ def restaurant_products(request):
             quantity_unit=quantity_unit,
             addons=addons,
         )
+        if uploaded_image:
+            food.image_file.save(f"{uuid.uuid4().hex}.jpg", uploaded_image, save=False)
         try:
             food.full_clean()
         except ValidationError as validation_error:
             return _error("; ".join(validation_error.messages))
         food.save()
-    return JsonResponse(_product_payload(food), status=201)
+    return JsonResponse(_product_payload(food, request), status=201)
 
 
 @csrf_protect
@@ -2432,15 +2488,33 @@ def restaurant_product_detail(request, food_id):
         food.delete()
         return JsonResponse({"message": "Product deleted."})
     try:
-        data = _json_body(request)
+        if request.content_type == "application/json":
+            data = _json_body(request)
+            uploaded_files = request.FILES
+        elif request.content_type == "multipart/form-data":
+            data, uploaded_files = MultiPartParser(
+                request.META, request, request.upload_handlers
+            ).parse()
+        else:
+            data = request.POST
+            uploaded_files = request.FILES
     except ValueError as error:
         return _error(str(error))
     name = str(data.get("name", food.name)).strip()
     description = str(data.get("description", food.description)).strip()
     image = str(data.get("image", food.image)).strip()
+    uploaded_image = uploaded_files.get("productImageFile")
+    if uploaded_image:
+        upload_error = _product_image_upload_error(uploaded_image)
+        if upload_error:
+            return _error(upload_error)
+        normalized_image = _normalize_product_image(uploaded_image)
+        if normalized_image is None:
+            return _error("Product image could not be processed.")
+        uploaded_image = normalized_image
     if not name or len(name) > 160 or len(description) > 2000:
         return _error("Product name and description are required and within the allowed length.")
-    if image:
+    if image and not uploaded_image:
         try:
             URLValidator(schemes=["http", "https"])(image)
         except ValidationError:
@@ -2470,7 +2544,14 @@ def restaurant_product_detail(request, food_id):
         return _error(str(error))
     food.name = name
     food.description = description
-    food.image = image
+    old_image_name = food.image_file.name if uploaded_image and food.image_file else ""
+    if "image" in data and not uploaded_image:
+        food.image = image
+        food.image_file = None
+    elif uploaded_image:
+        food.image_file.save(f"{uuid.uuid4().hex}.jpg", uploaded_image, save=False)
+        if "image" in data and image:
+            food.image = image
     food.price = price
     food.category = category
     quantity_unit = str(data.get("quantityUnit", "kg" if category and category.slug in {"groceries", "fruits", "vegetables"} else "piece"))
@@ -2492,7 +2573,12 @@ def restaurant_product_detail(request, food_id):
     except ValidationError as error:
         return _error(" ".join(error.messages))
     food.save()
-    return JsonResponse(_product_payload(food))
+    if old_image_name and old_image_name != food.image_file.name:
+        try:
+            food.image_file.storage.delete(old_image_name)
+        except Exception:
+            logger.exception("Could not delete replaced product image %s", old_image_name)
+    return JsonResponse(_product_payload(food, request))
 
 
 def restaurant_orders(request):

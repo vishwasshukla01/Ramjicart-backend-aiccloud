@@ -1,5 +1,6 @@
 import uuid
 import secrets
+import logging
 from decimal import Decimal
 
 from django.conf import settings
@@ -7,6 +8,8 @@ from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.utils import timezone
+
+logger = logging.getLogger(__name__)
 
 
 def generate_registration_number():
@@ -197,6 +200,7 @@ class Food(models.Model):
     name = models.CharField(max_length=160)
     description = models.TextField(blank=True)
     image = models.URLField(blank=True)
+    image_file = models.ImageField(upload_to="food-images/", blank=True)
     price = models.DecimalField(
         max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal("0.01"))]
     )
@@ -205,6 +209,17 @@ class Food(models.Model):
     quantity_unit = models.CharField(max_length=8, choices=[("piece", "Piece"), ("kg", "Kilogram")], default="piece")
     variants = models.JSONField(default=list, blank=True)
     addons = models.JSONField(default=list, blank=True)
+
+    def delete(self, *args, **kwargs):
+        image_field = self.image_file
+        image_name = image_field.name if image_field else ""
+        result = super().delete(*args, **kwargs)
+        if image_name:
+            try:
+                image_field.storage.delete(image_name)
+            except Exception:
+                logger.exception("Could not delete product image %s", image_name)
+        return result
 
     def __str__(self):
         return f"{self.name} ({self.restaurant.name})"

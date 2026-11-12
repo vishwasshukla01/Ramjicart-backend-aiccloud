@@ -2,12 +2,18 @@ import base64
 import hashlib
 import hmac
 import json
+import os
+import random
+import tempfile
+from io import BytesIO
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
+from PIL import Image
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
 
@@ -288,3 +294,181 @@ class DeliveryCartAPITests(TestCase):
         )
         self.assertEqual(verification.status_code, 200)
         self.assertTrue(verification.json()["verified"])
+
+
+class RestaurantProductImageUploadTests(TestCase):
+    def setUp(self):
+        user_model = get_user_model()
+        owner = user_model.objects.create_user(
+            username="image-owner@example.test",
+            email="image-owner@example.test",
+            password="SafePassword!2026",
+        )
+        self.restaurant = Restaurant.objects.create(
+            owner=owner,
+            name="Image Test Kitchen",
+            email="image-restaurant@example.test",
+            approved=True,
+        )
+        AccountProfile.objects.create(
+            user=owner,
+            role=AccountProfile.Role.RESTAURANT,
+            approved=True,
+        )
+        self.category = Category.objects.create(name="Image Test Meals")
+        self.client = APIClient()
+        token = RefreshToken.for_user(owner).access_token
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+
+        self.media_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.media_dir.cleanup)
+        media_settings = override_settings(MEDIA_ROOT=self.media_dir.name)
+        media_settings.enable()
+        self.addCleanup(media_settings.disable)
+
+    def _png_upload(self, name="meal.png"):
+        image = BytesIO()
+        Image.new("RGB", (1, 1), color="red").save(image, format="PNG")
+        return SimpleUploadedFile(name, image.getvalue(), content_type="image/png")
+
+    def _product_data(self, **overrides):
+        data = {
+            "productName": "Uploaded meal",
+            "productCategory": self.category.name,
+            "quantityUnit": "piece",
+            "productDescription": "",
+            "productImage": "",
+            "productPrice": "100",
+            "stockQuantity": "",
+            "variants": "",
+            "addons": "",
+        }
+        data.update(overrides)
+        return data
+
+    def test_product_create_and_update_accept_image_files_with_absolute_url(self):
+        created = self.client.post(
+            "/api/restaurant/products",
+            self._product_data(productImageFile=self._png_upload()),
+            format="multipart",
+        )
+        self.assertEqual(created.status_code, 201, created.json())
+        self.assertTrue(created.json()["image"].startswith("http://testserver/media/food-images/"))
+        food_id = created.json()["id"]
+
+        updated = self.client.put(
+            f"/api/restaurant/products/{food_id}",
+            {
+                "name": "Uploaded meal updated",
+                "price": "120",
+                "description": "",
+                "quantityUnit": "piece",
+                "variants": "[]",
+                "addons": "[]",
+                "stockQuantity": "",
+                "productImageFile": self._png_upload("updated.png"),
+            },
+            format="multipart",
+        )
+        self.assertEqual(updated.status_code, 200, updated.json())
+        self.assertTrue(
+            updated.json()["image"].startswith("http://testserver/media/food-images/")
+        )
+        self.assertTrue(updated.json()["image"].endswith(".jpg"))
+        self.assertTrue(
+            self.restaurant.foods.get(id=food_id)
+            .image_file.name.startswith("food-images/")
+        )
+        listed = self.client.get("/api/restaurant/products")
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.json()[0]["image"], updated.json()["image"])
+
+    def test_upload_is_normalized_and_replaced_file_is_deleted(self):
+        pixels = Image.new("RGB", (500, 500))
+        pixels.putdata([
+            (random.randrange(256), random.randrange(256), random.randrange(256))
+            for _ in range(500 * 500)
+        ])
+        source = BytesIO()
+        pixels.save(source, format="PNG")
+        source_bytes = source.getvalue()
+        created = self.client.post(
+            "/api/restaurant/products",
+            self._product_data(productImageFile=SimpleUploadedFile("large.png", source_bytes, content_type="image/png")), format="multipart"
+        )
+        self.assertEqual(created.status_code, 201, created.json())
+        food = self.restaurant.foods.get(pk=created.json()["id"])
+        first_path = food.image_file.path
+        self.assertTrue(first_path.endswith(".jpg"))
+        self.assertLess(os.path.getsize(first_path), len(source_bytes))
+        with Image.open(first_path) as saved:
+            self.assertEqual(saved.format, "JPEG")
+            self.assertLessEqual(max(saved.size), 1000)
+        second = self.client.put(
+            f"/api/restaurant/products/{food.id}",
+            {"productImageFile": self._png_upload("replacement.png")}, format="multipart"
+        )
+        self.assertEqual(second.status_code, 200, second.json())
+        self.assertFalse(os.path.exists(first_path))
+
+    def test_product_delete_removes_its_image_file(self):
+        created = self.client.post(
+            "/api/restaurant/products",
+            self._product_data(productImageFile=self._png_upload()), format="multipart"
+        )
+        food = self.restaurant.foods.get(pk=created.json()["id"])
+        image_path = food.image_file.path
+        deleted = self.client.delete(f"/api/restaurant/products/{food.id}")
+        self.assertEqual(deleted.status_code, 200, deleted.json())
+        self.assertFalse(os.path.exists(image_path))
+
+    def test_existing_url_only_food_still_returns_legacy_url(self):
+        food = Food.objects.create(
+            restaurant=self.restaurant, category=self.category, name="Legacy",
+            price=Decimal("100"), image="https://images.example.test/legacy.png"
+        )
+        response = self.client.get("/api/restaurant/products")
+        self.assertEqual(response.status_code, 200)
+        payload = next(item for item in response.json() if item["id"] == food.id)
+        self.assertEqual(payload["image"], food.image)
+
+    def test_product_create_keeps_url_image_flow(self):
+        image_url = "https://images.example.test/legacy-meal.png"
+        response = self.client.post(
+            "/api/restaurant/products",
+            self._product_data(productImage=image_url),
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 201, response.json())
+        self.assertEqual(response.json()["image"], image_url)
+        food = self.restaurant.foods.get(id=response.json()["id"])
+        self.assertEqual(food.image, image_url)
+        self.assertFalse(food.image_file)
+
+    def test_product_upload_rejects_invalid_image_signature(self):
+        response = self.client.post(
+            "/api/restaurant/products",
+            self._product_data(
+                productImageFile=SimpleUploadedFile(
+                    "not-an-image.png",
+                    b"not a png image",
+                    content_type="image/png",
+                )
+            ),
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_product_upload_rejects_files_over_three_megabytes(self):
+        response = self.client.post(
+            "/api/restaurant/products",
+            self._product_data(
+                productImageFile=SimpleUploadedFile(
+                    "large.png",
+                    b"\x89PNG\r\n\x1a\n" + b"x" * (3 * 1024 * 1024),
+                    content_type="image/png",
+                )
+            ),
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 400)
